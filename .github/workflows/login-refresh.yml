@@ -21,7 +21,6 @@ on:
         options:
           - login
           - check
-          - fp
   schedule:
     # 每日 1 次巡检（UTC 07:41 = 北京 15:41），避开整点与续约任务时段
     - cron: '41 7 * * *'
@@ -153,22 +152,3 @@ jobs:
             cookies.txt
             login_fail.png
           if-no-files-found: ignore
-
-  # ── 临时：secret 指纹比对（用完即删，不合并） ──────────────────────
-  fp:
-    name: secret 指纹
-    if: inputs.mode == 'fp'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: fingerprint
-        env:
-          PU: ${{ secrets.PANEL_USER }}
-          PP: ${{ secrets.PANEL_PASS }}
-          SIDS: ${{ secrets.SERVER_IDS }}
-        run: |
-          echo "PANEL_USER_sha12=$(printf '%s' "$PU" | sha256sum | cut -c1-12)"
-          echo "PANEL_USER_len=${#PU}"
-          echo "PANEL_PASS_sha12=$(printf '%s' "$PP" | sha256sum | cut -c1-12)"
-          echo "PANEL_PASS_len=${#PP}"
-          echo "SERVER_IDS_sha12=$(printf '%s' "$SIDS" | sha256sum | cut -c1-12)"
