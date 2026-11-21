@@ -182,11 +182,21 @@ def probe_session(cookie: str, timeout: float = 20) -> tuple[bool, str, str]:
 def estimate_expiry(state: dict) -> tuple[float | None, str]:
     """推算 cookie 到期时刻（epoch 秒）。
 
-    优先级：浏览器 cookie 自带 expiry > 上次刷新时刻 + TTL > 未知。
+    默认只用「上次刷新时刻 + TTL」，**不用**浏览器给的 expiry 属性：
+
+      · 2026-11-21 run 44903281031 实测，登录后 jexactyl_session 的 expiry 属性只有
+        12 小时（不是 6 日）——那是 Laravel 的滑动 session 寿命，不是真实死亡时刻。
+      · 真实寿命来自历史：01 仓 11-15 12:16 续约成功 → 11-21 09:58 失败，隔 5.9 日。
+        02 仓 11-08 成功 → 11-15 失败，隔 7 日窗口内同样失效。
+      · 拿 12 小时去算，巡检会天天误报，预警就变成噪音。
+
+    所以 expiry 属性只记进状态备查（cookie_expiry_raw），要启用就显式
+    设 COOKIE_USE_BROWSER_EXPIRY=1。
     """
-    exp = state.get("cookie_expiry")
-    if isinstance(exp, (int, float)) and exp > 0:
-        return float(exp), "浏览器 cookie 自带 expiry"
+    if os.getenv("COOKIE_USE_BROWSER_EXPIRY", "0") == "1":
+        exp = state.get("cookie_expiry_raw")
+        if isinstance(exp, (int, float)) and exp > 0:
+            return float(exp), "浏览器 cookie 自带 expiry（已手动启用）"
     issued = state.get("refreshed_at")
     if isinstance(issued, (int, float)) and issued > 0:
         return float(issued) + COOKIE_TTL_DAYS * 86400, f"上次刷新 + {COOKIE_TTL_DAYS:g} 日 TTL"
@@ -379,19 +389,23 @@ def main():
             log(f"   remember_web len={len(rem)}")
         log(f"   全部 cookie 名：{sorted(cookies.keys())}")
 
-        # 记下刷新时刻 + 浏览器给的 expiry（若有），供每日巡检推算到期。
+        # 记下刷新时刻供每日巡检推算到期。浏览器给的 expiry 属性只当参考记下来
+        # （它是 12 小时的滑动值，不是真实寿命，见 estimate_expiry 的注释）。
         # 只存时间戳和长度，不存 cookie 值 —— 状态文件要进 cache，不能带凭证。
-        cookie_expiry = None
+        raw_expiry = None
         for c in raw_cookies:
             if c.get("name") in WANT and c.get("expiry"):
-                cookie_expiry = float(c["expiry"])
+                raw_expiry = float(c["expiry"])
                 break
-        exp, basis = (cookie_expiry, "浏览器 cookie 自带 expiry") if cookie_expiry \
-            else (time.time() + COOKIE_TTL_DAYS * 86400, f"刷新时刻 + {COOKIE_TTL_DAYS:g} 日 TTL")
-        log(f"   到期推算: {datetime.fromtimestamp(exp):%Y-%m-%d %H:%M}（{basis}）")
+        if raw_expiry:
+            log(f"   浏览器给的 expiry 属性: {datetime.fromtimestamp(raw_expiry):%Y-%m-%d %H:%M}"
+                f"（滑动值，只记录，不用于推算）")
+        exp = time.time() + COOKIE_TTL_DAYS * 86400
+        log(f"   到期推算: {datetime.fromtimestamp(exp):%Y-%m-%d %H:%M}"
+            f"（刷新时刻 + {COOKIE_TTL_DAYS:g} 日 TTL）")
         save_state({
             "refreshed_at": time.time(),
-            "cookie_expiry": cookie_expiry,
+            "cookie_expiry_raw": raw_expiry,
             "session_len": len(sess),
             "has_remember": bool(rem),
             "cookie_names": sorted(cookies.keys()),
