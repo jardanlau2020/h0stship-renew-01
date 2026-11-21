@@ -48,7 +48,10 @@ WANT = ("jexactyl_session", "remember_web_")
 SEC_CHECK_TEXT = "Complete the security check"
 
 # ── cookie 有效期巡检 ──────────────────────────────────────────────────
-# 6 日：账密登录后拿到的 jexactyl_session 实测寿命。站方若改 TTL，改这个数即可。
+# 6 日：账密登录后拿到的 jexactyl_session 实测寿命。
+# ⚠️ 这个 6 日来自 **单次观测**（2026-11-15 12:16 续约成功 → 2026-11-21 09:58 失败，
+#    隔 5.9 日），不是定理。等新 cookie 真正用到失效那一刻，记下实际寿命；若与 6 日
+#    相差明显（例如只有 4 日），改这个默认值即可，代码不用动。
 COOKIE_TTL_DAYS = float(os.getenv("COOKIE_TTL_DAYS", "6"))
 # 剩不到这么多天就报警。cron 压到 3 日一轮，留 2 日余量正好卡在漏跑一轮也还活着。
 COOKIE_WARN_DAYS = float(os.getenv("COOKIE_WARN_DAYS", "2"))
