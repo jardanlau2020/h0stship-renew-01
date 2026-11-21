@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Host-Ship 登录并导出 cookie —— 探针的可用版。
+"""Host-Ship 登录并导出 cookie —— 探针的可用版 + cookie 到期巡检。
 
 探针 run 44895479028 已验证：账密 + 系统级鼠标点 Turnstile → 一次点击过盾
 （token_len=709）→ 登录成功 → 拿到 4 个 cookie。
 
-本脚本只做一件事：登录成功后，把可直接粘进 secret 的 cookie 串打印出来。
-不写 secret（那需要 PAT），不改 renew.py，不动业务。
+两种模式：
+  python login_refresh.py           登录并导出 cookie（workflow_dispatch）
+  python login_refresh.py --check   只读巡检当前 secret 里的 cookie，快到期就发 TG
 
-用法：workflow_dispatch 手动跑一次，复制输出的 `JEXACTYL_SESSION=...` 那行。
+本脚本不写 secret（那需要 PAT），不改 renew.py，不动业务。
+
+为什么要有 --check：jexactyl_session 是 Laravel 加密 cookie，值里读不出到期时间，
+浏览器侧也是 session cookie（无 expiry 属性）；实测寿命 6 日。所以到期时间只能用
+「上次成功刷新的时刻 + COOKIE_TTL_DAYS」推算。刷新时刻落 .cookie-state.json，
+由 workflow 用 actions/cache 跨 run 传递。巡检任务每天跑一次，剩不到
+COOKIE_WARN_DAYS（默认 2 日）或 cookie 已经失效，就发 TG 叫人去重跑 dispatch。
 """
 from __future__ import annotations
 
@@ -16,6 +23,9 @@ import json
 import os
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime
 
 PANEL = (os.getenv("PANEL_URL") or "https://panel.host-ship.com").rstrip("/")
@@ -36,6 +46,22 @@ WANT = ("jexactyl_session", "remember_web_")
 #   过盾后 "... Sign In ..."                       ← 这句消失 = 过了
 # 比 btn_enabled 可靠：Sign In 按钮本来就是过盾后才出现，等于在问同一件事。
 SEC_CHECK_TEXT = "Complete the security check"
+
+# ── cookie 有效期巡检 ──────────────────────────────────────────────────
+# 6 日：账密登录后拿到的 jexactyl_session 实测寿命。站方若改 TTL，改这个数即可。
+COOKIE_TTL_DAYS = float(os.getenv("COOKIE_TTL_DAYS", "6"))
+# 剩不到这么多天就报警。cron 压到 3 日一轮，留 2 日余量正好卡在漏跑一轮也还活着。
+COOKIE_WARN_DAYS = float(os.getenv("COOKIE_WARN_DAYS", "2"))
+STATE_FILE = os.getenv("COOKIE_STATE_FILE", ".cookie-state.json")
+ACCOUNT_API = "/api/client/account"
+
+# runner 是 UTF-8，Windows 本地控制台是 GBK —— 不兜底的话 log 里的 emoji 直接抛
+# UnicodeEncodeError，把「只是打日志」变成脚本崩溃。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 
 def log(*a):
@@ -100,7 +126,158 @@ def pass_turnstile(sb, timeout=60):
     return ""
 
 
+# ---------------------------------------------------------------- 状态文件
+
+def load_state() -> dict:
+    # utf-8-sig：Windows 侧写出来的状态文件可能带 BOM，用 utf-8 读会在 json.loads
+    # 直接抛 "Unexpected UTF-8 BOM"，然后被下面 except 静默吞掉 —— 表现成「状态永远
+    # 读不到、预警永远不触发」，最难查的那种静默失效。
+    try:
+        with open(STATE_FILE, encoding="utf-8-sig") as fh:
+            data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_state(data: dict) -> None:
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+        log(f"状态已写入 {STATE_FILE}（只含时间戳与长度，不含 cookie 值）")
+    except Exception as exc:
+        log("状态写入失败（不影响主流程）：", str(exc)[:150])
+
+
+# ---------------------------------------------------------------- 巡检
+
+def probe_session(cookie: str, timeout: float = 20) -> tuple[bool, str, str]:
+    """拿 cookie 打一次 /api/client/account：200 = 还活着。"""
+    if not cookie:
+        return False, "secret 里没有 JEXACTYL_SESSION", ""
+    req = urllib.request.Request(
+        PANEL + ACCOUNT_API,
+        headers={
+            "Cookie": f"jexactyl_session={cookie}",
+            "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0 (hostship-cookie-guard)",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8", "replace")
+            if resp.status != 200:
+                return False, f"HTTP {resp.status}", ""
+            try:
+                who = (json.loads(body).get("attributes") or {}).get("username") or ""
+            except Exception:
+                who = ""
+            return True, "HTTP 200", who
+    except urllib.error.HTTPError as exc:
+        return False, f"HTTP {exc.code}", ""
+    except Exception as exc:
+        return False, f"请求异常 {str(exc)[:120]}", ""
+
+
+def estimate_expiry(state: dict) -> tuple[float | None, str]:
+    """推算 cookie 到期时刻（epoch 秒）。
+
+    优先级：浏览器 cookie 自带 expiry > 上次刷新时刻 + TTL > 未知。
+    """
+    exp = state.get("cookie_expiry")
+    if isinstance(exp, (int, float)) and exp > 0:
+        return float(exp), "浏览器 cookie 自带 expiry"
+    issued = state.get("refreshed_at")
+    if isinstance(issued, (int, float)) and issued > 0:
+        return float(issued) + COOKIE_TTL_DAYS * 86400, f"上次刷新 + {COOKIE_TTL_DAYS:g} 日 TTL"
+    return None, "无状态记录（还没有成功刷新过）"
+
+
+def tg(text: str) -> bool:
+    """发 TG。优先用 renew-kit 的 notify.send（上游现成实现，不重复写）。"""
+    try:
+        from renewkit.notify import send
+        return send(text, parse_mode="HTML")
+    except Exception as exc:
+        log("renewkit 不可用，退回内置发送：", str(exc)[:150])
+
+    token = os.getenv("TG_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN") or ""
+    chat = os.getenv("TG_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID") or ""
+    if not token or not chat:
+        log("Telegram 未配置，跳过通知")
+        return False
+    data = urllib.parse.urlencode({
+        "chat_id": chat, "text": text,
+        "parse_mode": "HTML", "disable_web_page_preview": "true",
+    }).encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/sendMessage", data=data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            ok = json.loads(resp.read().decode("utf-8", "replace")).get("ok")
+            log("Telegram 通知已发送" if ok else "Telegram 通知失败")
+            return bool(ok)
+    except Exception as exc:
+        log("Telegram 通知异常：", str(exc)[:150])
+        return False
+
+
+def check_mode() -> int:
+    """只读巡检：cookie 是否还活着 + 还剩几天，不达标就发 TG。"""
+    state = load_state()
+    cookie = os.getenv("JEXACTYL_SESSION", "")
+    ok, detail, who = probe_session(cookie)
+    exp, basis = estimate_expiry(state)
+    now = time.time()
+    left_days = (exp - now) / 86400 if exp else None
+
+    log(f"面板: {PANEL}")
+    log(f"cookie 探测: {'✅ 有效' if ok else '❌ 失效'}（{detail}{' / ' + who if who else ''}）")
+    if exp:
+        log(f"到期推算: {datetime.fromtimestamp(exp):%Y-%m-%d %H:%M} 本地时间 "
+            f"（依据：{basis}），剩 {left_days:.2f} 日")
+    else:
+        log(f"到期推算: 未知（{basis}）")
+    log(f"阈值: 剩 < {COOKIE_WARN_DAYS:g} 日 或 cookie 已失效 → 报警")
+
+    reasons = []
+    if not ok:
+        reasons.append(f"cookie 已失效（{detail}）——续约必然失败，需要重跑 login-refresh 并更新 secret")
+    if left_days is not None and left_days < COOKIE_WARN_DAYS:
+        reasons.append(f"cookie 剩 {left_days:.2f} 日，低于 {COOKIE_WARN_DAYS:g} 日警戒线")
+
+    print("PROBE_RESULT_JSON " + json.dumps({
+        "ok": ok,
+        "detail": detail,
+        "username": who,
+        "expiry_epoch": exp,
+        "left_days": None if left_days is None else round(left_days, 2),
+        "basis": basis,
+        "warn_days": COOKIE_WARN_DAYS,
+        "alert": bool(reasons),
+    }), flush=True)
+
+    if not reasons:
+        log("✅ 巡检通过，不需要动作")
+        return 0
+
+    head = "🚨 Host-Ship cookie 失效" if not ok else "⚠️ Host-Ship cookie 快到期"
+    body = "\n".join(f"• {r}" for r in reasons)
+    tg(f"<b>{head}</b>\n{body}\n\n👉 处理：Actions → 「登录并导出 cookie」→ Run workflow，"
+       f"把 cookies.txt 里的 JEXACTYL_SESSION 更新到 secret。\n"
+       f"（{datetime.now():%Y-%m-%d %H:%M}）")
+    log("已报警：" + "；".join(reasons))
+    # 巡检只报不红：job 标红会掩盖真正的续约失败信号。
+    return 0
+
+
+# ---------------------------------------------------------------- 主流程
+
 def main():
+    if "--check" in sys.argv:
+        return check_mode()
+
     if not USER or not PASSWORD:
         log("❌ 缺 PANEL_USER / PANEL_PASS")
         return 2
@@ -169,7 +346,8 @@ def main():
                 pass
             return 6
 
-        cookies = {c["name"]: c["value"] for c in sb.driver.get_cookies()}
+        raw_cookies = sb.driver.get_cookies()
+        cookies = {c["name"]: c["value"] for c in raw_cookies}
         log(f"✅ 登录成功，拿到 {len(cookies)} 个 cookie")
 
         sess = cookies.get("jexactyl_session", "")
@@ -201,6 +379,25 @@ def main():
             log(f"   remember_web len={len(rem)}")
         log(f"   全部 cookie 名：{sorted(cookies.keys())}")
 
+        # 记下刷新时刻 + 浏览器给的 expiry（若有），供每日巡检推算到期。
+        # 只存时间戳和长度，不存 cookie 值 —— 状态文件要进 cache，不能带凭证。
+        cookie_expiry = None
+        for c in raw_cookies:
+            if c.get("name") in WANT and c.get("expiry"):
+                cookie_expiry = float(c["expiry"])
+                break
+        exp, basis = (cookie_expiry, "浏览器 cookie 自带 expiry") if cookie_expiry \
+            else (time.time() + COOKIE_TTL_DAYS * 86400, f"刷新时刻 + {COOKIE_TTL_DAYS:g} 日 TTL")
+        log(f"   到期推算: {datetime.fromtimestamp(exp):%Y-%m-%d %H:%M}（{basis}）")
+        save_state({
+            "refreshed_at": time.time(),
+            "cookie_expiry": cookie_expiry,
+            "session_len": len(sess),
+            "has_remember": bool(rem),
+            "cookie_names": sorted(cookies.keys()),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        })
+
         # 机器可读摘要（不含值）
         print("PROBE_RESULT_JSON " + json.dumps({
             "ok": True,
@@ -208,6 +405,8 @@ def main():
             "has_session": bool(sess),
             "has_remember": bool(rem),
             "session_len": len(sess),
+            "expiry_epoch": exp,
+            "left_days": round((exp - time.time()) / 86400, 2),
         }), flush=True)
         return 0
 
