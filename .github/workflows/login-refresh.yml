@@ -1,0 +1,73 @@
+name: 登录并导出 cookie
+
+# 探针（run 44895479028）已验证：账密 + 系统级鼠标点 Turnstile 一次即过（token_len=709），
+# 登录成功。本 workflow 把那个探针变成可用工具：跑一次，输出可直接粘进 secret 的
+# JEXACTYL_SESSION。
+#
+# 不写 secret（需要 PAT），不改 renew.py，不动业务。用完可以保留，cookie 再过期时再跑。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hostship-login-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    name: 登录导出
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 检出
+        uses: actions/checkout@v7
+
+      - name: 装 Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: 装图形依赖与 Xvfb
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y xvfb x11-utils libgbm1 fonts-noto-cjk
+          which Xvfb || exit 1
+          which xvfb-run || exit 1
+
+      - name: 装 seleniumbase
+        run: |
+          python -m pip install --upgrade pip
+          pip install 'seleniumbase==4.58.3'
+          python -c "import seleniumbase; print('seleniumbase', seleniumbase.__version__)"
+
+      - name: 登录并导出 cookie
+        env:
+          PANEL_URL: ${{ secrets.PANEL_URL }}
+          PANEL_USER: ${{ secrets.PANEL_USER }}
+          PANEL_PASS: ${{ secrets.PANEL_PASS }}
+        run: |
+          set +e
+          timeout -k 10 600 xvfb-run -a --server-args="-screen 0 1920x1080x24" \
+            python login_refresh.py > login.log 2>&1
+          rc=$?
+          echo "exit code: $rc"
+          cat login.log
+          exit $rc
+
+      - name: 上传日志与截图
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: login-output
+          # 冷王 2026-11-21：cookies.txt 里有明文凭证，artifact 默认留 90 天太长，
+          # 缩到 1 天。日志文件里没有明文（脚本只打印长度，不打印值）。
+          retention-days: 1
+          path: |
+            login.log
+            cookies.txt
+            login_fail.png
+          if-no-files-found: ignore
