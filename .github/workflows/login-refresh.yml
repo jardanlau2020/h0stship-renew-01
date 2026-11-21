@@ -1,4 +1,4 @@
-name: 登录并导出 cookie
+﻿name: 登录并导出 cookie
 
 # 探针（run 44895479028）已验证：账密 + 系统级鼠标点 Turnstile 一次即过（token_len=709），
 # 登录成功。本 workflow 把那个探针变成可用工具：跑一次，输出可直接粘进 secret 的
@@ -12,6 +12,15 @@ name: 登录并导出 cookie
 
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "login = 登录并导出 cookie；check = 只跑到期巡检（不启动浏览器）"
+        required: false
+        default: "login"
+        type: choice
+        options:
+          - login
+          - check
   schedule:
     # 每日 1 次巡检（UTC 07:41 = 北京 15:41），避开整点与续约任务时段
     - cron: '41 7 * * *'
@@ -27,7 +36,7 @@ jobs:
   # ── 每日巡检：只读，不登录 ──────────────────────────────────────────
   guard:
     name: cookie 到期巡检
-    if: github.event_name == 'schedule'
+    if: github.event_name == 'schedule' || inputs.mode == 'check'
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -74,7 +83,7 @@ jobs:
   # ── 手动登录导出（原流程） ─────────────────────────────────────────
   refresh:
     name: 登录导出
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && inputs.mode != 'check'
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
