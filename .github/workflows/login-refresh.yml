@@ -1,13 +1,29 @@
-name: 登录并导出 cookie
+﻿name: 登录并导出 cookie
 
 # 探针（run 44895479028）已验证：账密 + 系统级鼠标点 Turnstile 一次即过（token_len=709），
 # 登录成功。本 workflow 把那个探针变成可用工具：跑一次，输出可直接粘进 secret 的
 # JEXACTYL_SESSION。
 #
 # 不写 secret（需要 PAT），不改 renew.py，不动业务。用完可以保留，cookie 再过期时再跑。
+#
+# 2026-11-21 追加：cookie 只活 6 日，cron 已经压到 3 日一轮，但漏跑一轮仍会死。
+# 所以加 guard job：每天只读探一次 secret 里的 cookie，按「上次刷新时刻 + 6 日 TTL」
+# 推算到期，剩不到 2 日或已经失效就发 TG 叫人。guard 不登录、不碰浏览器，跑 10 秒。
 
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "login = 登录并导出 cookie；check = 只跑到期巡检（不启动浏览器）"
+        required: false
+        default: "login"
+        type: choice
+        options:
+          - login
+          - check
+  schedule:
+    # 每日 1 次巡检（UTC 07:41 = 北京 15:41），避开整点与续约任务时段
+    - cron: '41 7 * * *'
 
 permissions:
   contents: read
@@ -17,8 +33,57 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # ── 每日巡检：只读，不登录 ──────────────────────────────────────────
+  guard:
+    name: cookie 到期巡检
+    if: github.event_name == 'schedule' || inputs.mode == 'check'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 检出
+        uses: actions/checkout@v7
+
+      - name: 装 Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: 装 renewkit
+        run: |
+          python -m pip install --upgrade pip
+          pip install "renewkit @ git+https://github.com/jardanlau2020/renew-kit@v0.5.3"
+
+      # 状态文件只有时间戳和长度（无 cookie 值），用 cache 跨 run 传递。
+      # continue-on-error：cache 服务抖动/版本差异不能把巡检本身搞红。
+      - name: 恢复状态
+        uses: actions/cache/restore@v4
+        continue-on-error: true
+        with:
+          path: .cookie-state.json
+          key: hostship-01-cookie-state-${{ github.run_id }}
+          restore-keys: hostship-01-cookie-state-
+
+      - name: 巡检 cookie 有效期
+        env:
+          PANEL_URL: ${{ secrets.PANEL_URL }}
+          JEXACTYL_SESSION: ${{ secrets.JEXACTYL_SESSION }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: python login_refresh.py --check
+
+      - name: 保存状态
+        if: always()
+        uses: actions/cache/save@v4
+        continue-on-error: true
+        with:
+          path: .cookie-state.json
+          key: hostship-01-cookie-state-${{ github.run_id }}
+
+  # ── 手动登录导出（原流程） ─────────────────────────────────────────
   refresh:
     name: 登录导出
+    if: github.event_name == 'workflow_dispatch' && inputs.mode != 'check'
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -44,6 +109,14 @@ jobs:
           pip install 'seleniumbase==4.58.3'
           python -c "import seleniumbase; print('seleniumbase', seleniumbase.__version__)"
 
+      - name: 恢复状态
+        uses: actions/cache/restore@v4
+        continue-on-error: true
+        with:
+          path: .cookie-state.json
+          key: hostship-01-cookie-state-${{ github.run_id }}
+          restore-keys: hostship-01-cookie-state-
+
       - name: 登录并导出 cookie
         env:
           PANEL_URL: ${{ secrets.PANEL_URL }}
@@ -57,6 +130,14 @@ jobs:
           echo "exit code: $rc"
           cat login.log
           exit $rc
+
+      - name: 保存状态
+        if: always()
+        uses: actions/cache/save@v4
+        continue-on-error: true
+        with:
+          path: .cookie-state.json
+          key: hostship-01-cookie-state-${{ github.run_id }}
 
       - name: 上传日志与截图
         if: always()

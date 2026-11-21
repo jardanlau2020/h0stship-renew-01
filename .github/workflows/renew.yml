@@ -1,9 +1,11 @@
-name: Host-Ship 自动续约
+﻿name: Host-Ship 自动续约
 
 on:
   schedule:
-    # 每 7 日 1 次（周日 UTC 04:00 = 北京 12:00）
-    - cron: '0 4 * * 0'
+    # 每 3 日 1 次（UTC 04:17 = 北京 12:17，避开整点）。
+    # 2026-11-21：cookie 实测只活 6 日，原来 7 日一轮永远差一天，结构性必死。
+    # 压到 3 日一轮，漏跑一轮也还有余量；到期预警见 login-refresh.yml 的 guard job。
+    - cron: '17 */3 * * *'
   workflow_dispatch:
     inputs:
       dry_run:
