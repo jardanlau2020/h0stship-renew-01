@@ -1,14 +1,17 @@
-﻿name: 登录并导出 cookie
+name: 登录并导出 cookie
 
 # 探针（run 44895479028）已验证：账密 + 系统级鼠标点 Turnstile 一次即过（token_len=709），
-# 登录成功。本 workflow 把那个探针变成可用工具：跑一次，输出可直接粘进 secret 的
-# JEXACTYL_SESSION。
+# 登录成功。本 workflow 把那个探针变成可用工具：跑一次即可拿到新的 JEXACTYL_SESSION。
 #
-# 不写 secret（需要 PAT），不改 renew.py，不动业务。用完可以保留，cookie 再过期时再跑。
+# 2026-11-21 追加 guard：每天只读探一次 secret 里的 cookie，按「上次刷新时刻 + TTL」
+# 推算到期，剩不到 2 日或已经失效就发 TG 叫人。
 #
-# 2026-11-21 追加：cookie 只活 6 日，cron 已经压到 3 日一轮，但漏跑一轮仍会死。
-# 所以加 guard job：每天只读探一次 secret 里的 cookie，按「上次刷新时刻 + 6 日 TTL」
-# 推算到期，剩不到 2 日或已经失效就发 TG 叫人。guard 不登录、不碰浏览器，跑 10 秒。
+# 2026-11-23 总修改（根因：GitHub 会大量丢 schedule，renew 每 3 小时一轮实际只跑 2-3 次/日，
+# cookie 空闲 11 小时就死，回落到账密登录又被 Turnstile 挡死 → 告警）：
+#   1. refresh 改为定时自动跑（每 6 小时），不再需要人工点；
+#   2. 登录成功后用 GH_PAT 直接把新 cookie 写回 JEXACTYL_SESSION secret，闭环自动化；
+#   3. guard 改为仅手动触发（定时刷新已覆盖它原来的作用，避免 4 倍 TG 噪音）；
+#   4. artifact 只在手动触发时上传，定时跑不再堆明文凭证。
 
 on:
   workflow_dispatch:
@@ -22,8 +25,9 @@ on:
           - login
           - check
   schedule:
-    # 每日 1 次巡检（UTC 07:41 = 北京 15:41），避开整点与续约任务时段
-    - cron: '41 7 * * *'
+    # 每 6 小时自动刷新 cookie（UTC 00:41 / 06:41 / 12:41 / 18:41）
+    # 与 renew 的 '17 */3 * * *' 错开 24 分钟，避免抢同一时段
+    - cron: '41 0,6,12,18 * * *'
 
 permissions:
   contents: read
@@ -33,10 +37,10 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # ── 每日巡检：只读，不登录 ──────────────────────────────────────────
+  # ── 巡检：只读，不登录（仅手动 mode=check） ─────────────────────────
   guard:
     name: cookie 到期巡检
-    if: github.event_name == 'schedule' || inputs.mode == 'check'
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'check'
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -80,10 +84,10 @@ jobs:
           path: .cookie-state.json
           key: hostship-01-cookie-state-${{ github.run_id }}
 
-  # ── 手动登录导出（原流程） ─────────────────────────────────────────
+  # ── 登录并写回 secret（定时 + 手动） ───────────────────────────────
   refresh:
     name: 登录导出
-    if: github.event_name == 'workflow_dispatch' && inputs.mode != 'check'
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.mode != 'check')
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -131,6 +135,27 @@ jobs:
           cat login.log
           exit $rc
 
+      # 登录成功后把新 cookie 直接写回 secret，整个闭环不再需要人工。
+      # 只打印长度，不打印值。
+      - name: 写回 JEXACTYL_SESSION
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          set -euo pipefail
+          if [ ! -f cookies.txt ]; then echo "❌ 没有 cookies.txt"; exit 1; fi
+          COOKIE=$(python - <<'PY'
+          for line in open('cookies.txt', encoding='utf-8', errors='replace'):
+              p = [x.strip() for x in line.strip().split('\t')]
+              if len(p) >= 7 and p[5] == 'JEXACTYL_SESSION':
+                  print(p[6]); break
+          PY
+          )
+          if [ -z "${COOKIE}" ]; then echo "❌ 没解析到 JEXACTYL_SESSION"; exit 1; fi
+          echo "解析到 cookie，长度 ${#COOKIE}"
+          printf '%s' "$COOKIE" | gh secret set JEXACTYL_SESSION --repo "$GITHUB_REPOSITORY"
+          echo "✅ JEXACTYL_SESSION 已更新"
+
       - name: 保存状态
         if: always()
         uses: actions/cache/save@v4
@@ -140,12 +165,12 @@ jobs:
           key: hostship-01-cookie-state-${{ github.run_id }}
 
       - name: 上传日志与截图
-        if: always()
+        if: always() && github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v7
         with:
           name: login-output
-          # 冷王 2026-11-21：cookies.txt 里有明文凭证，artifact 默认留 90 天太长，
-          # 缩到 1 天。日志文件里没有明文（脚本只打印长度，不打印值）。
+          # cookies.txt 里有明文凭证，artifact 默认留 90 天太长，缩到 1 天；
+          # 定时跑不上传，避免每天堆一份明文凭证。
           retention-days: 1
           path: |
             login.log
