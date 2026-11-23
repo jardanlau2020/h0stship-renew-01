@@ -1,4 +1,4 @@
-﻿name: Host-Ship 自动续约
+name: Host-Ship 自动续约
 
 on:
   schedule:
@@ -31,6 +31,16 @@ jobs:
       - name: 检出
         uses: actions/checkout@v7
 
+      # 上游故障计数（连续几轮 522）。GHA 每次都是新容器，不恢复就是每轮从 0 起，
+      # 「连续 3 轮才升级告警」永远触发不了。
+      - name: ♻️ 恢复上游故障计数
+        uses: actions/cache/restore@v4
+        with:
+          path: hs_upstream_state.json
+          key: hsupstream-${{ github.run_id }}
+          restore-keys: |
+            hsupstream-
+
       # 迁移说明：原先手写 setup-python / pip install / 执行 三步，
       # 现改用 renew-kit 的 composite action，自动装好 Python 与 renewkit，
       # 并在脚本异常退出时兜底发一条 Telegram 通知。
@@ -54,3 +64,11 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           DRY_RUN: ${{ github.event.inputs.dry_run }}
+
+      - name: 💾 保存上游故障计数
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: hs_upstream_state.json
+          key: hsupstream-${{ github.run_id }}
