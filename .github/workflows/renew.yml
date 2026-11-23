@@ -1,4 +1,4 @@
-﻿name: Host-Ship 自动续约
+name: Host-Ship 自动续约
 
 on:
   schedule:
@@ -16,6 +16,8 @@ on:
 
 permissions:
   contents: read
+  # 2026-11-23 自愈：认证全挂时用 workflow 自己的 token 触发 login-refresh（不需要 PAT）
+  actions: write
 
 concurrency:
   group: hostship-renew
@@ -49,6 +51,8 @@ jobs:
       # action 的语法错（空 then 分支），所有跟 @main 的仓库一起变红 —— 本仓当时
       # 用的是旧版 action 才侥幸躲过。升级就改这两个 v0.4.2。
       - name: 执行续约
+        id: renew
+        continue-on-error: true
         uses: jardanlau2020/renew-kit/.github/actions/renew@v0.5.3
         with:
           script: renew.py
@@ -67,6 +71,27 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           DRY_RUN: ${{ github.event.inputs.dry_run }}
 
+      # ── 2026-11-23 自愈：三种认证（API Key / cookie / 帐密）全挂时主动重新登录 ──
+      # login-refresh.yml 会自己登录 + 用 GH_PAT 回写 secret，但它的定时是「每 3 天一次」；
+      # cookie 若在两次之间死掉（站方清 session、换密钥），就会空等最多 3 天。
+      # 这里失败即触发一次，下一轮 cron（3 小时）就能拿到新 cookie。
+      # 用 workflow 自己的 token（actions: write），不需要额外 PAT。
+      - name: 自愈 · 认证失败则触发重新登录
+        if: steps.renew.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "本轮续约失败（认证或上游）→ 触发 login-refresh.yml 重新登录并回写 cookie"
+          if gh workflow run login-refresh.yml --repo "${{ github.repository }}" --ref main -f mode=login; then
+            sleep 8
+            gh run list --repo "${{ github.repository }}" --workflow login-refresh.yml --limit 1 \
+              --json databaseId,status,event,createdAt \
+              --jq '.[] | "已触发 login-refresh run \(.databaseId) status=\(.status) event=\(.event)"'
+          else
+            echo "::warning::触发 login-refresh 失败 —— 检查 workflow 的 actions: write 权限或仓设置"
+          fi
+
       - name: 💾 保存上游故障计数
         if: always()
         continue-on-error: true
@@ -74,3 +99,6 @@ jobs:
         with:
           path: hs_upstream_state.json
           key: hsupstream-${{ github.run_id }}
+      - name: 结论 · 本轮没续上（保持非绿，别让失败看起来像成功）
+        if: steps.renew.outcome == 'failure'
+        run: exit 1
