@@ -2,7 +2,7 @@ name: Host-Ship 自动续约
 
 on:
   schedule:
-    # 每 3 小时 1 次（UTC 每小时 :17，避开整点）。
+    # 每 3 日 1 次（UTC 04:17 = 北京 12:17，避开整点）。
     # 2026-11-21：cookie 实测只活 6 日，原来 7 日一轮永远差一天，结构性必死。
     # 压到 3 日一轮，漏跑一轮也还有余量；到期预警见 login-refresh.yml 的 guard job。
     - cron: '17 */3 * * *'
@@ -13,14 +13,11 @@ on:
         required: false
         default: "false"
         type: boolean
-      force_relogin:
-        description: "强制先走浏览器登录换 cookie（自愈路径自测用）"
-        required: false
-        default: "false"
-        type: boolean
 
 permissions:
   contents: read
+  # 2026-11-23 自愈：认证全挂时用 workflow 自己的 token 触发 login-refresh（不需要 PAT）
+  actions: write
 
 concurrency:
   group: hostship-renew
@@ -30,7 +27,7 @@ jobs:
   renew:
     name: 续约
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 15
 
     steps:
       - name: 检出
@@ -46,84 +43,6 @@ jobs:
           restore-keys: |
             hsupstream-
 
-      # ══════════════ 2026-11-23 自愈：cookie 死了就现场登录换一条 ══════════════
-      # 背景：站方 2026-11-23 那次 522 之后把 session 存储清了，两个账号的
-      # jexactyl_session 同时 401，而登录接口要 Turnstile，纯 API 登录结构性过不了 ——
-      # 结果就是「cookie 一死必须有人手工粘」，这不是自动化。
-      # 现成能力其实仓库里就有：login_refresh.py（seleniumbase + xvfb + 系统级鼠标点
-      # Turnstile）实测能过盾拿到 4 个 cookie。所以把它搬进续约流程：
-      #   ① 注入 secret 里的 cookie → ② 探活 /api/client/account → ③ 401 就先登录换新的
-      #   → ④ 再跑续约（只跑一次，不产生「先失败再重试」的假告警）
-      # 顺序按「先探活后登录」，避免 renew 先撞 401 触发 telegram 误报。
-      - name: 注入 cookie（secret → env）
-        env:
-          COOKIE: ${{ secrets.JEXACTYL_SESSION }}
-        run: |
-          set -eu
-          if [ -n "${COOKIE:-}" ]; then
-            echo "JEXACTYL_SESSION=$COOKIE" >> "$GITHUB_ENV"
-            echo "已注入 secret 里的 cookie，长度 ${#COOKIE}"
-          else
-            echo "secret 里没有 JEXACTYL_SESSION，将直接走自愈登录"
-          fi
-
-      - name: cookie 探活
-        id: probe
-        env:
-          PANEL_URL: ${{ secrets.PANEL_URL }}
-        run: |
-          set +e
-          code=$(curl -s -o /tmp/account.json -w '%{http_code}' --max-time 25 \
-            -H "Cookie: jexactyl_session=${JEXACTYL_SESSION}" \
-            -H "Accept: application/json" \
-            "${PANEL_URL%/}/api/client/account")
-          echo "探活 GET /api/client/account → HTTP $code"
-          if [ "$code" = "200" ]; then
-            echo "alive=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "alive=false" >> "$GITHUB_OUTPUT"
-            echo "cookie 不可用（HTTP $code），本轮先自愈登录"
-          fi
-          exit 0
-
-      - name: 自愈 · 装图形依赖与 Xvfb
-        if: steps.probe.outputs.alive != 'true' || github.event.inputs.force_relogin == 'true'
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y xvfb x11-utils libgbm1 fonts-noto-cjk
-
-      - name: 自愈 · 装 seleniumbase
-        if: steps.probe.outputs.alive != 'true' || github.event.inputs.force_relogin == 'true'
-        run: |
-          python -m pip install --upgrade pip
-          pip install 'seleniumbase==4.58.3'
-
-      - name: 自愈 · 浏览器登录换 cookie
-        if: steps.probe.outputs.alive != 'true' || github.event.inputs.force_relogin == 'true'
-        env:
-          PANEL_URL: ${{ secrets.PANEL_URL }}
-          PANEL_USER: ${{ secrets.PANEL_USER }}
-          PANEL_PASS: ${{ secrets.PANEL_PASS }}
-        run: |
-          set +e
-          timeout -k 10 480 xvfb-run -a --server-args="-screen 0 1920x1080x24" \
-            python login_refresh.py > login.log 2>&1
-          rc=$?
-          cat login.log
-          if [ "$rc" -ne 0 ]; then
-            echo "::error::自愈登录失败（exit $rc），下面继续用旧 cookie 跑，失败会照常告警"
-            exit 0
-          fi
-          COOKIE=$(awk -F= '/^JEXACTYL_SESSION=/{sub(/^JEXACTYL_SESSION=/,"");print;exit}' cookies.txt)
-          if [ -z "$COOKIE" ]; then
-            echo "::error::登录成功但 cookies.txt 里没有 jexactyl_session"
-            exit 1
-          fi
-          # 值不打印：只写进后续步骤的 env，日志里只出现「已写入 + 长度」
-          echo "JEXACTYL_SESSION=$COOKIE" >> "$GITHUB_ENV"
-          rm -f cookies.txt .session.tmp
-          echo "✅ 已拿到新 cookie，长度 ${#COOKIE}"
-
       # 迁移说明：原先手写 setup-python / pip install / 执行 三步，
       # 现改用 renew-kit 的 composite action，自动装好 Python 与 renewkit，
       # 并在脚本异常退出时兜底发一条 Telegram 通知。
@@ -131,9 +50,9 @@ jobs:
       # renew-kit 钉在 tag 上（action 与 pip 两处都要钉）：main 上出过一次 composite
       # action 的语法错（空 then 分支），所有跟 @main 的仓库一起变红 —— 本仓当时
       # 用的是旧版 action 才侥幸躲过。升级就改这两个 v0.4.2。
-      # 注意：JEXACTYL_SESSION 不在这里显式声明 —— 否则会覆盖上面自愈写进
-      # $GITHUB_ENV 的新 cookie。旧值/新值都走 env 继承。
       - name: 执行续约
+        id: renew
+        continue-on-error: true
         uses: jardanlau2020/renew-kit/.github/actions/renew@v0.5.3
         with:
           script: renew.py
@@ -145,9 +64,33 @@ jobs:
           PANEL_USER: ${{ secrets.PANEL_USER }}
           PANEL_PASS: ${{ secrets.PANEL_PASS }}
           SERVER_IDS: ${{ secrets.SERVER_IDS }}
+          # 2026-11-23：首选纯 Bearer（不登录、不过 Turnstile、不受 cookie 寿命影响）
+          HS_API_KEY: ${{ secrets.HS_API_KEY }}
+          JEXACTYL_SESSION: ${{ secrets.JEXACTYL_SESSION }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           DRY_RUN: ${{ github.event.inputs.dry_run }}
+
+      # ── 2026-11-23 自愈：三种认证（API Key / cookie / 帐密）全挂时主动重新登录 ──
+      # login-refresh.yml 会自己登录 + 用 GH_PAT 回写 secret，但它的定时是「每 3 天一次」；
+      # cookie 若在两次之间死掉（站方清 session、换密钥），就会空等最多 3 天。
+      # 这里失败即触发一次，下一轮 cron（3 小时）就能拿到新 cookie。
+      # 用 workflow 自己的 token（actions: write），不需要额外 PAT。
+      - name: 自愈 · 认证失败则触发重新登录
+        if: steps.renew.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "本轮续约失败（认证或上游）→ 触发 login-refresh.yml 重新登录并回写 cookie"
+          if gh workflow run login-refresh.yml --repo "${{ github.repository }}" --ref main -f mode=login; then
+            sleep 8
+            gh run list --repo "${{ github.repository }}" --workflow login-refresh.yml --limit 1 \
+              --json databaseId,status,event,createdAt \
+              --jq '.[] | "已触发 login-refresh run \(.databaseId) status=\(.status) event=\(.event)"'
+          else
+            echo "::warning::触发 login-refresh 失败 —— 检查 workflow 的 actions: write 权限或仓设置"
+          fi
 
       - name: 💾 保存上游故障计数
         if: always()
@@ -156,3 +99,6 @@ jobs:
         with:
           path: hs_upstream_state.json
           key: hsupstream-${{ github.run_id }}
+      - name: 结论 · 本轮没续上（保持非绿，别让失败看起来像成功）
+        if: steps.renew.outcome == 'failure'
+        run: exit 1
