@@ -1,17 +1,19 @@
 name: 登录并导出 cookie
 
 # 探针（run 44895479028）已验证：账密 + 系统级鼠标点 Turnstile 一次即过（token_len=709），
-# 登录成功。本 workflow 把那个探针变成可用工具：跑一次即可拿到新的 JEXACTYL_SESSION。
+# 登录成功。本 workflow 把那个探针变成可用工具。
 #
-# 2026-11-21 追加 guard：每天只读探一次 secret 里的 cookie，按「上次刷新时刻 + TTL」
-# 推算到期，剩不到 2 日或已经失效就发 TG 叫人。
+# 2026-11-21 追加：cookie 只活约 6 日，cron 已经压到 3 日一轮，但漏跑一轮仍会死。
+# 所以加 guard job：每天只读探一次 secret 里的 cookie，按「上次刷新时刻 + 6 日 TTL」
+# 推算到期，剩不到 2 日或已经失效就报警。
 #
-# 2026-11-23 总修改（根因：GitHub 会大量丢 schedule，renew 每 3 小时一轮实际只跑 2-3 次/日，
-# cookie 空闲 11 小时就死，回落到账密登录又被 Turnstile 挡死 → 告警）：
-#   1. refresh 改为定时自动跑（每 6 小时），不再需要人工点；
-#   2. 登录成功后用 GH_PAT 直接把新 cookie 写回 JEXACTYL_SESSION secret，闭环自动化；
-#   3. guard 改为仅手动触发（定时刷新已覆盖它原来的作用，避免 4 倍 TG 噪音）；
-#   4. artifact 只在手动触发时上传，定时跑不再堆明文凭证。
+# 2026-11-23 改造（自愈闭环）：
+#   · guard 不再只是「发 TG 叫人」，判定需要换 cookie 时直接触发同 workflow 的 refresh job；
+#   · refresh 拿到 cookie 后，若配了 secret GH_PAT 就用 gh secret set 自动回写
+#     JEXACTYL_SESSION —— 这是唯一需要 PAT 的一步（GITHUB_TOKEN 无权写 secrets）。
+#     没配 GH_PAT 时不报错、只跳过，此时靠 renew.yml 的「探活 + 浏览器登录」兜底，
+#     整条链依然无人值守。
+#   · cookie 值不进日志：只经文件/stdin 传给 gh，日志只打印长度。
 
 on:
   workflow_dispatch:
@@ -25,9 +27,8 @@ on:
           - login
           - check
   schedule:
-    # 每 6 小时自动刷新 cookie（UTC 00:41 / 06:41 / 12:41 / 18:41）
-    # 与 renew 的 '17 */3 * * *' 错开 24 分钟，避免抢同一时段
-    - cron: '41 0,6,12,18 * * *'
+    # 每日 1 次巡检（UTC 07:41 = 北京 15:41），避开整点与续约任务时段
+    - cron: '41 7 * * *'
 
 permissions:
   contents: read
@@ -37,12 +38,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # ── 巡检：只读，不登录（仅手动 mode=check） ─────────────────────────
+  # ── 每日巡检：只读探活；判定需要换 cookie 就由下面的 refresh job 自愈 ──
   guard:
     name: cookie 到期巡检
-    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'check'
+    if: github.event_name == 'schedule' || inputs.mode == 'check'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    outputs:
+      need_refresh: ${{ steps.probe.outputs.need_refresh }}
 
     steps:
       - name: 检出
@@ -69,12 +72,24 @@ jobs:
           restore-keys: hostship-01-cookie-state-
 
       - name: 巡检 cookie 有效期
+        id: probe
         env:
           PANEL_URL: ${{ secrets.PANEL_URL }}
           JEXACTYL_SESSION: ${{ secrets.JEXACTYL_SESSION }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: python login_refresh.py --check
+        run: |
+          set +e
+          python login_refresh.py --check 2>&1 | tee check.log
+          # login_refresh.py --check 固定 exit 0（只报不红），靠 PROBE_RESULT_JSON 里的
+          # "alert": true 判断是否需要换 cookie。
+          if grep -q '"alert": true' check.log; then
+            echo "need_refresh=true" >> "$GITHUB_OUTPUT"
+            echo "⚠️ 巡检判定需要换 cookie → 本 workflow 直接跑 login 自愈"
+          else
+            echo "need_refresh=false" >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
 
       - name: 保存状态
         if: always()
@@ -84,12 +99,20 @@ jobs:
           path: .cookie-state.json
           key: hostship-01-cookie-state-${{ github.run_id }}
 
-  # ── 登录并写回 secret（定时 + 手动） ───────────────────────────────
+  # ── 登录导出：手动 dispatch（mode=login）或 guard 判定需要换 cookie 时自动跑 ──
   refresh:
     name: 登录导出
-    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.mode != 'check')
+    needs: [guard]
+    if: >-
+      always() && (
+        (github.event_name == 'workflow_dispatch' && inputs.mode != 'check')
+        || needs.guard.outputs.need_refresh == 'true'
+      )
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
+    env:
+      # PAT 只用于「写 secret」这一步；没配就跳过（见文首说明）。
+      GH_PAT: ${{ secrets.GH_PAT }}
 
     steps:
       - name: 检出
@@ -135,26 +158,30 @@ jobs:
           cat login.log
           exit $rc
 
-      # 登录成功后把新 cookie 直接写回 secret，整个闭环不再需要人工。
-      # 只打印长度，不打印值。
-      - name: 写回 JEXACTYL_SESSION
-        if: success()
-        env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
+      # 唯一需要 PAT 的一步：GITHUB_TOKEN 无权写 repository secrets。
+      # 值全程走文件 / stdin，日志只打印长度。
+      - name: 回写 secret JEXACTYL_SESSION（配了 GH_PAT 才执行）
         run: |
           set -euo pipefail
-          if [ ! -f cookies.txt ]; then echo "❌ 没有 cookies.txt"; exit 1; fi
-          COOKIE=$(python - <<'PY'
-          for line in open('cookies.txt', encoding='utf-8', errors='replace'):
-              p = [x.strip() for x in line.strip().split('\t')]
-              if len(p) >= 7 and p[5] == 'JEXACTYL_SESSION':
-                  print(p[6]); break
-          PY
-          )
-          if [ -z "${COOKIE}" ]; then echo "❌ 没解析到 JEXACTYL_SESSION"; exit 1; fi
-          echo "解析到 cookie，长度 ${#COOKIE}"
-          printf '%s' "$COOKIE" | gh secret set JEXACTYL_SESSION --repo "$GITHUB_REPOSITORY"
-          echo "✅ JEXACTYL_SESSION 已更新"
+          if [ -z "${GH_PAT:-}" ]; then
+            echo "未配置 GH_PAT → 跳过 secret 回写。cookie 只在 artifact 里；"
+            echo "本仓库的无人值守由 renew.yml 的「探活 + 浏览器登录」兜底，功能不受影响。"
+            exit 0
+          fi
+          if [ ! -s cookies.txt ]; then
+            echo "没有 cookies.txt（登录未成功？），跳过回写"
+            exit 0
+          fi
+          awk -F= '/^JEXACTYL_SESSION=/{sub(/^JEXACTYL_SESSION=/,"");print;exit}' cookies.txt > .session.tmp
+          n=$(wc -c < .session.tmp | tr -d ' ')
+          if [ "${n:-0}" -lt 20 ]; then
+            echo "cookie 长度异常（$n），跳过回写"
+            rm -f .session.tmp
+            exit 1
+          fi
+          GH_TOKEN="$GH_PAT" gh secret set JEXACTYL_SESSION --repo "${{ github.repository }}" < .session.tmp
+          rm -f .session.tmp
+          echo "✅ 已写入 secret JEXACTYL_SESSION，长度 $n"
 
       - name: 保存状态
         if: always()
@@ -165,12 +192,12 @@ jobs:
           key: hostship-01-cookie-state-${{ github.run_id }}
 
       - name: 上传日志与截图
-        if: always() && github.event_name == 'workflow_dispatch'
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: login-output
-          # cookies.txt 里有明文凭证，artifact 默认留 90 天太长，缩到 1 天；
-          # 定时跑不上传，避免每天堆一份明文凭证。
+          # 冷王 2026-11-21：cookies.txt 里有明文凭证，artifact 默认留 90 天太长，
+          # 缩到 1 天。日志文件里没有明文（脚本只打印长度，不打印值）。
           retention-days: 1
           path: |
             login.log
