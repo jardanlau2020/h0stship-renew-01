@@ -60,6 +60,8 @@ jobs:
           PANEL_USER: ${{ secrets.PANEL_USER }}
           PANEL_PASS: ${{ secrets.PANEL_PASS }}
           SERVER_IDS: ${{ secrets.SERVER_IDS }}
+          # 2026-11-23：首选纯 Bearer（不登录、不过 Turnstile、不受 cookie 寿命影响）
+          HS_API_KEY: ${{ secrets.HS_API_KEY }}
           JEXACTYL_SESSION: ${{ secrets.JEXACTYL_SESSION }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
