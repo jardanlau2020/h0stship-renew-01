@@ -1,22 +1,22 @@
-name: Host-Ship 自动续约
+﻿name: Host-Ship 鑷姩缁害
 
 on:
   schedule:
-    # 每 3 日 1 次（UTC 04:17 = 北京 12:17，避开整点）。
-    # 2026-11-21：cookie 实测只活 6 日，原来 7 日一轮永远差一天，结构性必死。
-    # 压到 3 日一轮，漏跑一轮也还有余量；到期预警见 login-refresh.yml 的 guard job。
+    # 姣?3 鏃?1 娆★紙UTC 04:17 = 鍖椾含 12:17锛岄伩寮€鏁寸偣锛夈€?
+    # 2026-11-21锛歝ookie 瀹炴祴鍙椿 6 鏃ワ紝鍘熸潵 7 鏃ヤ竴杞案杩滃樊涓€澶╋紝缁撴瀯鎬у繀姝汇€?
+    # 鍘嬪埌 3 鏃ヤ竴杞紝婕忚窇涓€杞篃杩樻湁浣欓噺锛涘埌鏈熼璀﹁ login-refresh.yml 鐨?guard job銆?
     - cron: '17 */3 * * *'
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Dry run (不真正续约)"
+        description: "Dry run (涓嶇湡姝ｇ画绾?"
         required: false
         default: "false"
         type: boolean
 
 permissions:
   contents: read
-  # 2026-11-23 自愈：认证全挂时用 workflow 自己的 token 触发 login-refresh（不需要 PAT）
+  # 2026-11-23 鑷剤锛氳璇佸叏鎸傛椂鐢?workflow 鑷繁鐨?token 瑙﹀彂 login-refresh锛堜笉闇€瑕?PAT锛?
   actions: write
 
 concurrency:
@@ -25,17 +25,17 @@ concurrency:
 
 jobs:
   renew:
-    name: 续约
+    name: 缁害
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
     steps:
-      - name: 检出
+      - name: 妫€鍑?
         uses: actions/checkout@v7
 
-      # 上游故障计数（连续几轮 522）。GHA 每次都是新容器，不恢复就是每轮从 0 起，
-      # 「连续 3 轮才升级告警」永远触发不了。
-      - name: ♻️ 恢复上游故障计数
+      # 涓婃父鏁呴殰璁℃暟锛堣繛缁嚑杞?522锛夈€侴HA 姣忔閮芥槸鏂板鍣紝涓嶆仮澶嶅氨鏄瘡杞粠 0 璧凤紝
+      # 銆岃繛缁?3 杞墠鍗囩骇鍛婅銆嶆案杩滆Е鍙戜笉浜嗐€?
+      - name: 鈾伙笍 鎭㈠涓婃父鏁呴殰璁℃暟
         uses: actions/cache/restore@v4
         with:
           path: hs_upstream_state.json
@@ -43,62 +43,63 @@ jobs:
           restore-keys: |
             hsupstream-
 
-      # 迁移说明：原先手写 setup-python / pip install / 执行 三步，
-      # 现改用 renew-kit 的 composite action，自动装好 Python 与 renewkit，
-      # 并在脚本异常退出时兜底发一条 Telegram 通知。
-      # 面板凭据通过本 step 的 env 传入，composite action 会继承。
-      # renew-kit 钉在 tag 上（action 与 pip 两处都要钉）：main 上出过一次 composite
-      # action 的语法错（空 then 分支），所有跟 @main 的仓库一起变红 —— 本仓当时
-      # 用的是旧版 action 才侥幸躲过。升级就改这两个 v0.4.2。
-      - name: 执行续约
+      # 杩佺Щ璇存槑锛氬師鍏堟墜鍐?setup-python / pip install / 鎵ц 涓夋锛?
+      # 鐜版敼鐢?renew-kit 鐨?composite action锛岃嚜鍔ㄨ濂?Python 涓?renewkit锛?
+      # 骞跺湪鑴氭湰寮傚父閫€鍑烘椂鍏滃簳鍙戜竴鏉?Telegram 閫氱煡銆?
+      # 闈㈡澘鍑嵁閫氳繃鏈?step 鐨?env 浼犲叆锛宑omposite action 浼氱户鎵裤€?
+      # renew-kit 閽夊湪 tag 涓婏紙action 涓?pip 涓ゅ閮借閽夛級锛歮ain 涓婂嚭杩囦竴娆?composite
+      # action 鐨勮娉曢敊锛堢┖ then 鍒嗘敮锛夛紝鎵€鏈夎窡 @main 鐨勪粨搴撲竴璧峰彉绾?鈥斺€?鏈粨褰撴椂
+      # 鐢ㄧ殑鏄棫鐗?action 鎵嶄茎骞歌翰杩囥€傚崌绾у氨鏀硅繖涓や釜 v0.4.2銆?
+      - name: 鎵ц缁害
         id: renew
         continue-on-error: true
-        uses: jardanlau2020/renew-kit/.github/actions/renew@v0.5.3
+        uses: jardanlau2020/renew-kit/.github/actions/renew@v0.6.0
         with:
           script: renew.py
           python-version: "3.12"
-          renewkit-ref: v0.5.3
+          renewkit-ref: v0.6.0
           requirements: requirements.txt
         env:
           PANEL_URL: ${{ secrets.PANEL_URL }}
           PANEL_USER: ${{ secrets.PANEL_USER }}
           PANEL_PASS: ${{ secrets.PANEL_PASS }}
           SERVER_IDS: ${{ secrets.SERVER_IDS }}
-          # 2026-11-23：首选纯 Bearer（不登录、不过 Turnstile、不受 cookie 寿命影响）
+          # 2026-11-23锛氶閫夌函 Bearer锛堜笉鐧诲綍銆佷笉杩?Turnstile銆佷笉鍙?cookie 瀵垮懡褰卞搷锛?
           HS_API_KEY: ${{ secrets.HS_API_KEY }}
           JEXACTYL_SESSION: ${{ secrets.JEXACTYL_SESSION }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           DRY_RUN: ${{ github.event.inputs.dry_run }}
 
-      # ── 2026-11-23 自愈：三种认证（API Key / cookie / 帐密）全挂时主动重新登录 ──
-      # login-refresh.yml 会自己登录 + 用 GH_PAT 回写 secret，但它的定时是「每 3 天一次」；
-      # cookie 若在两次之间死掉（站方清 session、换密钥），就会空等最多 3 天。
-      # 这里失败即触发一次，下一轮 cron（3 小时）就能拿到新 cookie。
-      # 用 workflow 自己的 token（actions: write），不需要额外 PAT。
-      - name: 自愈 · 认证失败则触发重新登录
+      # 鈹€鈹€ 2026-11-23 鑷剤锛氫笁绉嶈璇侊紙API Key / cookie / 甯愬瘑锛夊叏鎸傛椂涓诲姩閲嶆柊鐧诲綍 鈹€鈹€
+      # login-refresh.yml 浼氳嚜宸辩櫥褰?+ 鐢?GH_PAT 鍥炲啓 secret锛屼絾瀹冪殑瀹氭椂鏄€屾瘡 3 澶╀竴娆°€嶏紱
+      # cookie 鑻ュ湪涓ゆ涔嬮棿姝绘帀锛堢珯鏂规竻 session銆佹崲瀵嗛挜锛夛紝灏变細绌虹瓑鏈€澶?3 澶┿€?
+      # 杩欓噷澶辫触鍗宠Е鍙戜竴娆★紝涓嬩竴杞?cron锛? 灏忔椂锛夊氨鑳芥嬁鍒版柊 cookie銆?
+      # 鐢?workflow 鑷繁鐨?token锛坅ctions: write锛夛紝涓嶉渶瑕侀澶?PAT銆?
+      - name: 鑷剤 路 璁よ瘉澶辫触鍒欒Е鍙戦噸鏂扮櫥褰?
         if: steps.renew.outcome == 'failure'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          echo "本轮续约失败（认证或上游）→ 触发 login-refresh.yml 重新登录并回写 cookie"
+          echo "鏈疆缁害澶辫触锛堣璇佹垨涓婃父锛夆啋 瑙﹀彂 login-refresh.yml 閲嶆柊鐧诲綍骞跺洖鍐?cookie"
           if gh workflow run login-refresh.yml --repo "${{ github.repository }}" --ref main -f mode=login; then
             sleep 8
             gh run list --repo "${{ github.repository }}" --workflow login-refresh.yml --limit 1 \
               --json databaseId,status,event,createdAt \
-              --jq '.[] | "已触发 login-refresh run \(.databaseId) status=\(.status) event=\(.event)"'
+              --jq '.[] | "宸茶Е鍙?login-refresh run \(.databaseId) status=\(.status) event=\(.event)"'
           else
-            echo "::warning::触发 login-refresh 失败 —— 检查 workflow 的 actions: write 权限或仓设置"
+            echo "::warning::瑙﹀彂 login-refresh 澶辫触 鈥斺€?妫€鏌?workflow 鐨?actions: write 鏉冮檺鎴栦粨璁剧疆"
           fi
 
-      - name: 💾 保存上游故障计数
+      - name: 馃捑 淇濆瓨涓婃父鏁呴殰璁℃暟
         if: always()
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
           path: hs_upstream_state.json
           key: hsupstream-${{ github.run_id }}
-      - name: 结论 · 本轮没续上（保持非绿，别让失败看起来像成功）
+      - name: 缁撹 路 鏈疆娌＄画涓婏紙淇濇寔闈炵豢锛屽埆璁╁け璐ョ湅璧锋潵鍍忔垚鍔燂級
         if: steps.renew.outcome == 'failure'
         run: exit 1
+
