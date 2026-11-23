@@ -24,7 +24,7 @@ import sys
 import time
 import urllib.parse
 
-from renewkit import Outcome, RenewReport
+from renewkit import Outcome, RenewReport, notify
 from renewkit import env
 from renewkit.http import TransientError, build_session, request
 from renewkit.timeutil import days_left
@@ -41,6 +41,84 @@ TOPUP_INTERVAL_S = env.get_int("TOPUP_INTERVAL_S", 10)
 TOPUP_GOAL_DAYS = env.get_int("TOPUP_GOAL_DAYS", 28)
 
 SERVICE = "Host-Ship"
+
+# ══════════════════ 2026-11-23 上游不可达不再算成功 ══════════════════
+# 旧行为（renewkit v0.5.3 的语义）：面板 5xx / 连不上 → TransientError →
+# 记 Outcome.TRANSIENT，而 Outcome.is_error 只认 FAILED，于是 exit 0、
+# job 标绿。源站报 HTTP 522 时脚本"本次跳过"被当成成功，一轮轮过去没人在意，
+# cookie 每跳过一轮就老一点，最后静默烂掉。
+#
+# 现在三类判定分开：
+#   ✅ 真续期成功 —— 拿到新到期日，且确实往后推了（读不到 / 没变化 → 结果未确认）
+#   🟢 未到续期窗口 —— renewable=false，正常跳过，绿灯但要写明原因
+#   ⚠️ 上游不可达 —— 522 / 源站挂 / 超时，**不算成功**：run 必须非绿
+# 另外连续 UPSTREAM_STREAK_THRESHOLD 轮上游不可达时，升级成一条醒目的告警
+# （只发一次），避免源站长期挂着而没人发现。
+STATE_FILE = env.get("HS_UPSTREAM_STATE", "hs_upstream_state.json")
+UPSTREAM_STREAK_THRESHOLD = env.get_int("UPSTREAM_STREAK_THRESHOLD", 3)
+
+
+def _load_state() -> dict:
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_state(st: dict) -> None:
+    # 状态只是计数辅助，写不进去不能影响本轮结论。
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as fh:
+            json.dump(st, fh, ensure_ascii=False, indent=2, sort_keys=True)
+    except Exception as exc:
+        log(f"  ⚠️ 上游故障计数写入失败（不影响本轮结论）: {exc}")
+
+
+def _upstream_codes(report) -> str:
+    """从 TRANSIENT 明细里抠出 HTTP 状态码，用于通知里点名（如 522）。"""
+    codes = set()
+    for r in report.results:
+        if r.outcome is Outcome.TRANSIENT:
+            for m in re.finditer(r"HTTP\s*(\d{3})", r.detail or ""):
+                codes.add(m.group(1))
+    return "/".join(sorted(codes)) if codes else "源站不可达"
+
+
+def finalize(report: RenewReport) -> int:
+    """统一收尾：发通知 + 三类判定 + 上游不可达时的非绿与连续告警。"""
+    exit_code = report.finish(notify_tg=False)   # 只渲染 + 打印，通知统一在这里发
+    worst = report.worst
+    upstream_down = worst is Outcome.TRANSIENT
+
+    st = _load_state()
+    streak = int(st.get("upstream_streak") or 0)
+    alerted = bool(st.get("upstream_alerted"))
+    if upstream_down:
+        streak += 1
+    else:
+        streak, alerted = 0, False
+
+    text = report.render()
+    if upstream_down:
+        # 上游不可达 ≠ 成功：run 必须非绿，否则又会静默烂掉。
+        exit_code = 1
+        code_txt = _upstream_codes(report)
+        text += (f"\n\n⚠️ 上游面板不可用（{code_txt}），非我方凭证问题，请稍后重试。"
+                 f"\nℹ️ 已连续 {streak} 轮上游不可达。")
+        if streak >= UPSTREAM_STREAK_THRESHOLD and not alerted:
+            text = (f"🚨 连续 {streak} 轮上游面板不可达（{code_txt}），"
+                    f"源站可能长期故障，请人工核查。\n\n") + text
+            alerted = True
+            log(f"  🚨 连续 {streak} 轮上游不可达，升级告警（本轮只发一次）")
+
+    st.update(upstream_streak=streak, upstream_alerted=alerted,
+              last_run=time.strftime("%Y-%m-%d %H:%M:%S"), last_worst=worst.value)
+    _save_state(st)
+
+    notify.send(text)
+    return exit_code
 
 
 def log(msg: str) -> None:
@@ -217,7 +295,7 @@ def main() -> int:
     if not USER or not PASS:
         report = RenewReport(SERVICE)
         report.add("凭证", Outcome.FAILED, detail="缺少 PANEL_USER / PANEL_PASS")
-        return report.finish()
+        return finalize(report)
 
     log(f"🚀 {SERVICE} 续约 @ {time.strftime('%Y-%m-%d %H:%M:%S')}")
     log(f"面板: {PANEL} | 服务器: {SERVER_IDS} | dry_run={DRY_RUN}")
@@ -228,10 +306,10 @@ def main() -> int:
         session = login()
     except TransientError as exc:
         report.add("登录", Outcome.TRANSIENT, detail=str(exc))
-        return report.finish()
+        return finalize(report)
     except Exception as exc:
         report.add("登录", Outcome.FAILED, detail=str(exc)[:150])
-        return report.finish()
+        return finalize(report)
 
     for sid in SERVER_IDS:
         log(f"── 服务器 {sid} ──")
@@ -267,14 +345,23 @@ def main() -> int:
 
         if outcome is Outcome.RENEWED:
             log(f"  {msg} | 新 renewal={new_exp}")
-            report.add(name, Outcome.RENEWED, expire=new_exp or renewal)
+            # 真成功 = 拿到新到期日且确实往后推了；读不到 / 没变化 只能算「结果未确认」，
+            # 不能再像旧码那样报成功（那等于把"没验证"当成"续上了"）。
+            if new_exp is None:
+                report.add(name, Outcome.UNKNOWN, expire=renewal,
+                           detail="面板返回成功，但续后读不到到期日，无法确认")
+            elif renewal and str(new_exp) == str(renewal):
+                report.add(name, Outcome.UNKNOWN, expire=new_exp,
+                           detail=f"面板返回成功，但到期日未变化（{renewal}）")
+            else:
+                report.add(name, Outcome.RENEWED, expire=new_exp or renewal)
         elif outcome is Outcome.ALREADY_MAX:
             report.add(name, Outcome.ALREADY_MAX, expire=renewal)
         else:
             clean = re.sub(r"^[❌⏭️]\s*", "", msg or "")[:120]
             report.add(name, Outcome.FAILED, expire=renewal, detail=clean)
 
-    return report.finish()
+    return finalize(report)
 
 
 if __name__ == "__main__":
