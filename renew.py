@@ -37,7 +37,7 @@ import sys
 import time
 import urllib.parse
 
-from renewkit import Outcome, RenewReport, notify
+from renewkit import Outcome, RenewReport, notify, verdict
 from renewkit import env
 from renewkit.http import TransientError, build_session, request
 from renewkit.timeutil import days_left
@@ -138,6 +138,11 @@ def finalize(report: RenewReport) -> int:
     _save_state(st)
 
     notify.send(text)
+    # 落判据给 renew-kit 的 Gate 步骤读。口径与最终 exit_code 对齐：
+    # 上游不可达被本仓提级成 exit 1，判据也要落 FAILED，不能按 worst=TRANSIENT 放绿。
+    gate_outcome = Outcome.FAILED if upstream_down else worst
+    verdict.record(gate_outcome, detail=" | ".join(
+        f"{r.name}:{r.outcome.value}" for r in report.results))
     return exit_code
 
 
